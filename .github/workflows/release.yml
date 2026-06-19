@@ -1,0 +1,152 @@
+name: Release
+
+# Dispatched manually with a version. The workflow owns the whole release:
+# it builds the OCI image from `main`, publishes the SwiftPM package onto the
+# `swiftpm` branch, tags that commit `vX.Y.Z`, and creates the GitHub Release
+# (with the OCI tarball asset) on the same tag.
+#
+# The version tag lives on the `swiftpm` commit (NOT on `main`) because SwiftPM
+# expects a valid Package.swift at every versioned tag. `main` stays pure Rust.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, no leading v (e.g. 0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  # Push the swiftpm branch + tag, and publish the GitHub Release.
+  contents: write
+
+# Serialize releases: parallel dispatches would race on the shared `swiftpm`
+# branch and tag pushes (non-fast-forward failures). Queue, don't cancel.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Native arm64 runner — no QEMU emulation, no Docker daemon required.
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Need the token persisted to push the swiftpm branch + tag.
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Validate version
+        # Pass the input through env (never interpolate ${{ }} directly into the
+        # shell) to avoid template injection from a crafted version string.
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "version '$VERSION' must be semver (e.g. 1.2.3)"; exit 1; }
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "tag v$VERSION already exists"; exit 1
+          fi
+
+      - name: Install Rust toolchain
+        # Reads rust-toolchain.toml — installs the pinned stable + musl target.
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache Cargo dependencies
+        # Cache only registry/git dependencies — not `target/`. Release builds
+        # compile fresh for artifact integrity, and the `release-` key prefix
+        # isolates this cache from the PR-triggered CI cache so a poisoned CI
+        # entry can never be restored into the release job.
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: release-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Install build dependencies
+        # musl-tools: provides musl-gcc for static linking (.cargo/config.toml sets it as linker).
+        # buildah: explicit install — availability on arm64 runners is not guaranteed.
+        run: sudo apt-get update && sudo apt-get install -y musl-tools buildah
+
+      - name: Build static binary
+        run: cargo build --release --bin dns-forwarder --target aarch64-unknown-linux-musl
+
+      - name: Verify binary
+        run: |
+          file target/aarch64-unknown-linux-musl/release/dns-forwarder
+          ls -lh target/aarch64-unknown-linux-musl/release/dns-forwarder
+
+      - name: Build OCI image with buildah
+        # FROM scratch + single binary = minimal image, no Docker daemon needed.
+        run: |
+          ctr=$(buildah from scratch)
+          buildah add "$ctr" target/aarch64-unknown-linux-musl/release/dns-forwarder /dns-forwarder
+          buildah config --entrypoint '["/dns-forwarder"]' "$ctr"
+          buildah config --arch arm64 --os linux "$ctr"
+          buildah commit "$ctr" socktainer-dns:embedded
+          buildah rm "$ctr"
+
+      - name: Export OCI tarball
+        run: |
+          buildah push socktainer-dns:embedded oci-archive:socktainer-dns.tar
+          gzip -f socktainer-dns.tar
+          echo "SIZE=$(wc -c < socktainer-dns.tar.gz | tr -d ' ')" >> "$GITHUB_ENV"
+          echo "Tarball: $(ls -lh socktainer-dns.tar.gz)"
+
+      - name: Publish SwiftPM package to the swiftpm branch
+        # Assemble the package in an isolated worktree so the main checkout (with
+        # build artifacts) never leaks into the swiftpm branch. The branch
+        # accumulates one commit per release, so older Package.resolved pins stay
+        # resolvable; the OCI blob lives only here, never on main.
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          tarball="$PWD/socktainer-dns.tar.gz"
+
+          if git ls-remote --exit-code --heads origin swiftpm >/dev/null 2>&1; then
+            git fetch origin swiftpm
+            git worktree add /tmp/pkg swiftpm
+          else
+            # Portable orphan creation (avoids the version-fragile `worktree --orphan` flag).
+            git worktree add --detach /tmp/pkg HEAD
+            ( cd /tmp/pkg && git checkout --orphan swiftpm )
+          fi
+
+          # Replace branch contents with the current release's package + image.
+          ( cd /tmp/pkg && git rm -rfq . 2>/dev/null || true )
+          mkdir -p /tmp/pkg/Sources/SocktainerDNSImage
+          cp packaging/swift/Package.swift /tmp/pkg/Package.swift
+          cp packaging/swift/Sources/SocktainerDNSImage/SocktainerDNSImage.swift /tmp/pkg/Sources/SocktainerDNSImage/
+          cp "$tarball" /tmp/pkg/Sources/SocktainerDNSImage/socktainer-dns.tar.gz
+
+          cd /tmp/pkg
+          git add -A
+          git commit -m "release: socktainer-dns v${VERSION} swift package"
+          git tag "v${VERSION}"
+          git push origin swiftpm
+          git push origin "v${VERSION}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: v${{ inputs.version }}
+          files: socktainer-dns.tar.gz
+          body: |
+            OCI image tarball for `socktainer-dns:embedded` (linux/arm64, static Rust binary via musl).
+
+            **Tarball size:** ${{ env.SIZE }} bytes
+            **Runtime:** ~1-2 MB RAM, no external dependencies
+
+            **Consume as a SwiftPM package** (recommended):
+            ```swift
+            .package(url: "https://github.com/socktainer/dns-forwarder.git", exact: "${{ inputs.version }}")
+            ```
+            Or fetch this OCI tarball asset directly.

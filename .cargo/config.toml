@@ -1,0 +1,6 @@
+# musl-gcc is only available on Linux (apt install musl-tools).
+# On macOS, do not attempt to build the musl target directly —
+# use `make build` instead, which compiles inside rust:alpine via Docker.
+# This config is only active in CI (ubuntu-24.04-arm) and Linux dev environments.
+[target.aarch64-unknown-linux-musl]
+linker = "musl-gcc"
