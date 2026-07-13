@@ -120,12 +120,21 @@ jobs:
             ( cd /tmp/pkg && git checkout --orphan swiftpm )
           fi
 
-          # Replace branch contents with the current release's package + image.
+          # Replace branch contents with the current release's package. The image is
+          # compiled into the binary as a C byte array (no resource bundle), so a
+          # standalone socktainer executable carries it — see socktainer issue #316.
           ( cd /tmp/pkg && git rm -rfq . 2>/dev/null || true )
-          mkdir -p /tmp/pkg/Sources/SocktainerDNSImage
+          mkdir -p /tmp/pkg/Sources/SocktainerDNSImage /tmp/pkg/Sources/CSocktainerDNSImage/include
           cp packaging/swift/Package.swift /tmp/pkg/Package.swift
           cp packaging/swift/Sources/SocktainerDNSImage/SocktainerDNSImage.swift /tmp/pkg/Sources/SocktainerDNSImage/
-          cp "$tarball" /tmp/pkg/Sources/SocktainerDNSImage/socktainer-dns.tar.gz
+          cp packaging/swift/Sources/CSocktainerDNSImage/include/CSocktainerDNSImage.h /tmp/pkg/Sources/CSocktainerDNSImage/include/
+          {
+            xxd -i -n socktainer_dns_targz "$tarball" \
+              | sed -E 's/^unsigned char /static const unsigned char /; s/^unsigned int /static const unsigned int /'
+            printf '\n#include "CSocktainerDNSImage.h"\n'
+            printf 'const unsigned char *socktainer_dns_image_bytes(void) { return socktainer_dns_targz; }\n'
+            printf 'unsigned int socktainer_dns_image_len(void) { return socktainer_dns_targz_len; }\n'
+          } > /tmp/pkg/Sources/CSocktainerDNSImage/embedded_dns_image.c
 
           cd /tmp/pkg
           git add -A

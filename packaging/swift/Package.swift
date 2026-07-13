@@ -2,17 +2,16 @@
 //
 // SwiftPM distribution package for the socktainer-dns OCI image.
 //
-// This manifest does NOT live at the root of `main` — `main` is the Rust source.
-// On each release, the workflow copies these files to the root of the `swiftpm`
-// branch, drops the freshly built `socktainer-dns.tar.gz` next to the source, and
-// tags that commit `vX.Y.Z`. socktainer then consumes a specific version with:
+// `main` is the Rust source. On each release the workflow builds the OCI tarball,
+// generates `Sources/CSocktainerDNSImage/embedded_dns_image.c` from it (the image
+// bytes as a C array), copies these package files onto the `swiftpm` branch, and
+// tags that commit `vX.Y.Z`. socktainer consumes a version with:
 //
 //     .package(url: "https://github.com/socktainer/dns-forwarder.git", exact: "X.Y.Z")
 //
-// SwiftPM resolves by tag (branch-agnostic), checks out that commit, and bundles
-// the tarball as a resource. There is no SwiftPM way to reference the tarball by
-// URL (`.binaryTarget` only accepts artifactbundle/xcframework), so the package
-// carries the image as a `.copy` resource.
+// The archive is compiled into the binary (CSocktainerDNSImage), not shipped as a
+// resource bundle, so a standalone `socktainer` executable carries the image with
+// no co-located `.bundle` to lose (see socktainer issue #316).
 import PackageDescription
 
 let package = Package(
@@ -21,12 +20,10 @@ let package = Package(
         .library(name: "SocktainerDNSImage", targets: ["SocktainerDNSImage"]),
     ],
     targets: [
+        .target(name: "CSocktainerDNSImage"),
         .target(
             name: "SocktainerDNSImage",
-            resources: [
-                // Byte-identical copy — never process/optimize an OCI archive.
-                .copy("socktainer-dns.tar.gz"),
-            ]
+            dependencies: ["CSocktainerDNSImage"]
         ),
     ]
 )
